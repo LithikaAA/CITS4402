@@ -16,6 +16,8 @@ import time
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics.pairwise import cosine_distances
  
 import cv2
 import numpy as np
@@ -28,6 +30,7 @@ os.makedirs(MODELS_DIR, exist_ok=True)
  
 DETECTOR_MODEL_PATH   = os.path.join(MODELS_DIR, 'blaze_face_short_range.tflite')
 LANDMARKER_MODEL_PATH = os.path.join(MODELS_DIR, 'face_landmarker.task')
+SFACE_MODEL_PATH = os.path.join(MODELS_DIR, 'face_recognition_sface_2021dec.onnx')
  
 DETECTOR_URL   = ('https://storage.googleapis.com/mediapipe-models/'
                   'face_detector/blaze_face_short_range/float16/1/'
@@ -35,6 +38,8 @@ DETECTOR_URL   = ('https://storage.googleapis.com/mediapipe-models/'
 LANDMARKER_URL = ('https://storage.googleapis.com/mediapipe-models/'
                   'face_landmarker/face_landmarker/float16/1/'
                   'face_landmarker.task')
+SFACE_URL = ('https://github.com/opencv/opencv_zoo/raw/main/models/'
+             'face_recognition_sface/face_recognition_sface_2021dec.onnx')
  
  
 def _download_if_missing(path, url):
@@ -49,6 +54,7 @@ def _download_if_missing(path, url):
  
 _download_if_missing(DETECTOR_MODEL_PATH,   DETECTOR_URL)
 _download_if_missing(LANDMARKER_MODEL_PATH, LANDMARKER_URL)
+_download_if_missing(SFACE_MODEL_PATH, SFACE_URL)
  
 # ── MediaPipe Tasks imports ─────────────────────────────────────────────────
 from mediapipe.tasks import python as mp_python
@@ -272,102 +278,150 @@ def overlay_faces(out_img, faces, lmks_list):
 # ─────────────────────────────────────────────
  
 def process_image(bgr_img, draw=True):
-    out     = bgr_img.copy()
-    boxes   = detect_faces(bgr_img)[:4]
+    out = bgr_img.copy()
+    boxes = detect_faces(bgr_img)[:4]
     n_faces = len(boxes)
- 
+
     for (x, y, w, h) in boxes:
         draw_box(out, x, y, w, h)
- 
+
     if n_faces == 0:
-        return out, [], 0
- 
-    all_lmks      = detect_landmarks(bgr_img, boxes)
-    faces         = []
-    aligned_lmks  = []
- 
+        return out, [], [], 0
+
+    all_lmks = detect_landmarks(bgr_img, boxes)
+
+    faces = []
+    embedding_faces = []
+    aligned_lmks = []
+
     for (x, y, w, h), lmks in zip(boxes, all_lmks):
         if lmks is None:
-            lmks = ((x+w//4, y+h//3), (x+3*w//4, y+h//3), (x+w//2, y+h//2))
+            lmks = (
+                (x + w // 4, y + h // 3),
+                (x + 3 * w // 4, y + h // 3),
+                (x + w // 2, y + h // 2)
+            )
+
         re, le, nt = lmks
- 
+
         if draw:
             draw_landmarks(out, re, le, nt)
- 
+
         face, M = align_face(bgr_img, re, le, nt)
         faces.append(face)
- 
+
+        embed_crop = crop_face_for_embedding(bgr_img, (x, y, w, h))
+
+        if embed_crop is not None:
+            embedding_faces.append(embed_crop)
+        else:
+            embedding_faces.append(face)
+
         def clamp(p):
-            return (int(np.clip(p[0], 0, OUTPUT_SIZE-1)),
-                    int(np.clip(p[1], 0, OUTPUT_SIZE-1)))
- 
+            return (
+                int(np.clip(p[0], 0, OUTPUT_SIZE - 1)),
+                int(np.clip(p[1], 0, OUTPUT_SIZE - 1))
+            )
+
         re_a, le_a, nt_a = transform_landmarks(M, [re, le, nt])
         aligned_lmks.append((clamp(re_a), clamp(le_a), clamp(nt_a)))
- 
+
     overlay_faces(out, faces, aligned_lmks)
-    return out, faces, n_faces
+
+    return out, faces, embedding_faces, n_faces
  
  
 # ─────────────────────────────────────────────
-# FEATURE EXTRACTION
+# FEATURE EXTRACTION USING DEEPFACE AND CROP HELPER
 # ─────────────────────────────────────────────
- 
+def crop_face_for_embedding(bgr_img, box, margin=0.35):
+    x, y, w, h = box
+    h_img, w_img = bgr_img.shape[:2]
+
+    cx = x + w / 2
+    cy = y + h / 2
+
+    size = int(max(w, h) * (1.0 + margin))
+
+    x1 = int(max(0, cx - size / 2))
+    y1 = int(max(0, cy - size / 2))
+    x2 = int(min(w_img, cx + size / 2))
+    y2 = int(min(h_img, cy + size / 2))
+
+    crop = bgr_img[y1:y2, x1:x2]
+
+    if crop.size == 0:
+        return None
+
+    return crop
+
+
+
+from deepface import DeepFace
+
+DEEPFACE_MODEL_NAME = "Facenet512"
+
+
 def extract_embedding(face_bgr):
-    gray = cv2.resize(cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY), (64, 64))
- 
-    lbp = _lbp_hist(gray)
- 
-    hog_desc = cv2.HOGDescriptor(
-        _winSize=(64,64), _blockSize=(16,16), _blockStride=(8,8),
-        _cellSize=(8,8),  _nbins=9)
-    hog = hog_desc.compute(gray).flatten()
- 
-    hsv = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2HSV)
-    hh  = cv2.calcHist([hsv], [0], None, [16], [0, 180]).flatten()
-    sh  = cv2.calcHist([hsv], [1], None, [16], [0, 256]).flatten()
-    hh /= (hh.sum() + 1e-6)
-    sh /= (sh.sum() + 1e-6)
- 
-    feat = np.concatenate([lbp, hog, hh, sh])
-    return feat / (np.linalg.norm(feat) + 1e-6)
- 
- 
-def _lbp_hist(gray, P=8, R=1, bins=256):
-    h, w   = gray.shape
-    lbp    = np.zeros_like(gray, dtype=np.uint8)
-    angles = [2 * np.pi * p / P for p in range(P)]
-    offs   = [(R * np.cos(a), -R * np.sin(a)) for a in angles]
-    for y in range(1, h-1):
-        for x in range(1, w-1):
-            c    = int(gray[y, x])
-            code = 0
-            for bit, (dy, dx) in enumerate(offs):
-                ny = int(np.clip(round(y+dy), 0, h-1))
-                nx = int(np.clip(round(x+dx), 0, w-1))
-                code |= (int(gray[ny, nx]) >= c) << bit
-            lbp[y, x] = code
-    hist, _ = np.histogram(lbp.flatten(), bins=bins, range=(0, 256))
-    hist = hist.astype(np.float32)
-    return hist / (hist.sum() + 1e-6)
+    face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+
+    reps = DeepFace.represent(
+        img_path=face_rgb,
+        model_name=DEEPFACE_MODEL_NAME,
+        detector_backend="skip",
+        enforce_detection=False,
+        align=False
+    )
+
+    if isinstance(reps, list):
+        embedding = reps[0]["embedding"]
+    else:
+        embedding = reps["embedding"]
+
+    embedding = np.asarray(embedding, dtype=np.float32)
+    embedding = embedding / (np.linalg.norm(embedding) + 1e-6)
+
+    return embedding
  
  
 # ─────────────────────────────────────────────
 # CLUSTERING
 # ─────────────────────────────────────────────
  
-def cluster_identities(embeddings, eps=0.35, min_samples=1):
+def cluster_identities(embeddings, distance_threshold=0.52):
     if not embeddings:
         return np.array([], dtype=int)
-    from sklearn.cluster import DBSCAN
-    labels  = DBSCAN(eps=eps, min_samples=min_samples,
-                     metric='cosine').fit_predict(np.vstack(embeddings))
-    max_lbl = max(labels.max(), -1)
-    new_lbl = labels.copy()
-    for i, l in enumerate(labels):
-        if l == -1:
-            max_lbl += 1
-            new_lbl[i] = max_lbl
-    return new_lbl
+
+    
+
+    X = np.vstack(embeddings)
+    D = cosine_distances(X)
+
+    print("Cosine distance matrix:")
+    print(np.round(D, 3))
+
+    try:
+        model = AgglomerativeClustering(
+            n_clusters=None,
+            metric="precomputed",
+            linkage="complete",
+            distance_threshold=distance_threshold
+        )
+    except TypeError:
+        model = AgglomerativeClustering(
+            n_clusters=None,
+            affinity="precomputed",
+            linkage="complete",
+            distance_threshold=distance_threshold
+        )
+
+    labels = model.fit_predict(D)
+
+    unique_labels = sorted(set(labels))
+    remap = {old: new for new, old in enumerate(unique_labels)}
+    labels = np.array([remap[x] for x in labels], dtype=int)
+
+    return labels
  
  
 # ─────────────────────────────────────────────
@@ -400,13 +454,16 @@ def bulk_process(folder_path, progress_callback=None):
         bgr = cv2.imread(os.path.join(folder_path, fname))
         if bgr is None:
             continue
-        _, aligned, n = process_image(bgr, draw=False)
+        _, aligned, embedding_faces, n = process_image(bgr, draw=False)
         total_faces += n
         n_done      += 1
-        for m, face in enumerate(aligned):
-            face_rs = cv2.resize(face, (OUTPUT_SIZE, OUTPUT_SIZE))
-            embeddings.append(extract_embedding(face_rs))
-            records.append((m, face_rs))
+        for display_face, embed_face in zip(aligned, embedding_faces):
+            display_face_rs = cv2.resize(display_face, (OUTPUT_SIZE, OUTPUT_SIZE))
+
+            embeddings.append(extract_embedding(embed_face))
+
+            global_face_id = len(records)
+            records.append((global_face_id, display_face_rs))
         if progress_callback:
             progress_callback(n_done, len(files))
  
@@ -416,6 +473,20 @@ def bulk_process(folder_path, progress_callback=None):
         n_identities = int(labels.max()) + 1
         for (m, img), lbl in zip(records, labels):
             cv2.imwrite(os.path.join(out_folder, f'Identity_{lbl}_face_{m}.jpg'), img)
+
+    labels = cluster_identities(embeddings)
+    print("Cluster labels:", labels)
+
+    groups = {}
+    for (face_id, _), lbl in zip(records, labels):
+        groups.setdefault(lbl, []).append(face_id)
+
+    print("Identity groups:")
+    for lbl, face_ids in groups.items():
+        print(f"Identity {lbl}: faces {face_ids}")
+
+    n_identities = int(labels.max()) + 1
+    print("Number of identities:", n_identities)
  
     return dict(n_images=n_done, n_faces=total_faces, n_identities=n_identities,
                 elapsed=time.time()-t0, output_folder=out_folder)
@@ -427,7 +498,7 @@ def bulk_process(folder_path, progress_callback=None):
  
 DISPLAY_W = 380
 DISPLAY_H = 285
-BG        = '#e8e1f2'   # soft lilac
+BG        = "#6600f4"   # soft lilac
 BTN_CLR   = '#f57bbc'
 BTN_ACT   = '#f8a8d2'
  
@@ -474,7 +545,7 @@ def single_image():
     root.update()
  
     t0 = time.time()
-    out, _, n_faces = process_image(bgr)
+    out, _, _, n_faces = process_image(bgr)
     elapsed = time.time() - t0
  
     show_image(out, lbl_output, 'right')

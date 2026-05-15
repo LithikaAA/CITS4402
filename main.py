@@ -388,7 +388,7 @@ def extract_embedding(face_bgr):
 # CLUSTERING
 # ─────────────────────────────────────────────
  
-def cluster_identities(embeddings, distance_threshold=0.52):
+def cluster_identities(embeddings, distance_threshold=0.62):
     if not embeddings:
         return np.array([], dtype=int)
 

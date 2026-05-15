@@ -101,12 +101,12 @@ def skin_ratio_in_box(mask, x, y, w, h):
 def _build_detector():
     opts = mp_vision.FaceDetectorOptions(
         base_options=mp_python.BaseOptions(model_asset_path=DETECTOR_MODEL_PATH),
-        min_detection_confidence=0.4,
+        min_detection_confidence=0.25,
     )
     return mp_vision.FaceDetector.create_from_options(opts)
  
  
-def detect_faces(bgr_img, skin_threshold=0.10):
+def detect_faces(bgr_img, skin_threshold=0.05):
     h_img, w_img = bgr_img.shape[:2]
     s_mask  = skin_mask(bgr_img)
     rgb     = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
@@ -370,7 +370,7 @@ def process_image(bgr_img, draw=True):
         for old_centre in kept_box_centres:
             centre_dist = np.linalg.norm(current_centre - old_centre)
 
-            if centre_dist < 30:
+            if centre_dist < 8:
                 is_duplicate = True
                 break
 
@@ -383,7 +383,7 @@ def process_image(bgr_img, draw=True):
                 np.linalg.norm(current_triplet - old_triplet, axis=1)
             )
 
-            if landmark_dist < 30:
+            if landmark_dist < 15:
                 is_duplicate = True
                 break
 
@@ -403,7 +403,7 @@ def process_image(bgr_img, draw=True):
         for old_hash in kept_face_hashes:
             similarity = float(np.dot(face_hash, old_hash))
 
-            if similarity > 0.9:
+            if similarity > 0.995:
                 is_duplicate = True
                 break
 
@@ -495,7 +495,7 @@ def extract_embedding(face_bgr):
 # CLUSTERING
 # ─────────────────────────────────────────────
  
-def cluster_identities(embeddings, distance_threshold=0.62):
+def cluster_identities(embeddings, distance_threshold=0.6):
     if not embeddings:
         return np.array([], dtype=int)
 
@@ -511,7 +511,7 @@ def cluster_identities(embeddings, distance_threshold=0.62):
         model = AgglomerativeClustering(
             n_clusters=None,
             metric="precomputed",
-            linkage="complete",
+            linkage="average",
             distance_threshold=distance_threshold
         )
     except TypeError:
@@ -580,9 +580,35 @@ def bulk_process(folder_path, progress_callback=None):
         labels = cluster_identities(embeddings)
         n_identities = int(labels.max()) + 1
 
+        filtered_records = []
+        filtered_labels = []
+        seen_source_identity = set()
+
+        for record, lbl in zip(records, labels):
+            face_id, img, source_fname = record
+            source_base = os.path.splitext(source_fname)[0]
+            key = (source_base, int(lbl))
+
+            if key in seen_source_identity:
+                print(f"Skipping duplicate from source image {source_base}: face {face_id} in Identity_{lbl}")
+                continue
+
+            seen_source_identity.add(key)
+            filtered_records.append(record)
+            filtered_labels.append(lbl)
+
+        records = filtered_records
+        labels = np.array(filtered_labels, dtype=int)
+
+        n_identities = len(set(labels))
+        total_faces = len(records)
+
         for (m, img, source_fname), lbl in zip(records, labels):
             base_name = os.path.splitext(source_fname)[0]
-            cv2.imwrite(os.path.join(out_folder, f'Identity_{lbl}_{base_name}_face_{m}.jpg'), img)
+            cv2.imwrite(
+                os.path.join(out_folder, f'Identity_{lbl}_{base_name}_face_{m}.jpg'),
+                img
+            )
 
         print("Cluster labels:", labels)
 

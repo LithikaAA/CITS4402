@@ -101,12 +101,12 @@ def skin_ratio_in_box(mask, x, y, w, h):
 def _build_detector():
     opts = mp_vision.FaceDetectorOptions(
         base_options=mp_python.BaseOptions(model_asset_path=DETECTOR_MODEL_PATH),
-        min_detection_confidence=0.4,
+        min_detection_confidence=0.25,
     )
     return mp_vision.FaceDetector.create_from_options(opts)
  
  
-def detect_faces(bgr_img, skin_threshold=0.10):
+def detect_faces(bgr_img, skin_threshold=0.05):
     h_img, w_img = bgr_img.shape[:2]
     s_mask  = skin_mask(bgr_img)
     rgb     = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
@@ -138,6 +138,31 @@ def detect_faces(bgr_img, skin_threshold=0.10):
     return [(int(boxes_np[i][0]), int(boxes_np[i][1]),
              int(boxes_np[i][2] - boxes_np[i][0]),
              int(boxes_np[i][3] - boxes_np[i][1])) for i in indices]
+
+def remove_duplicate_face_boxes(boxes, centre_threshold=45):
+    unique = []
+
+    for box in boxes:
+        x, y, w, h = box
+        cx = x + w / 2
+        cy = y + h / 2
+
+        is_duplicate = False
+
+        for ux, uy, uw, uh in unique:
+            ucx = ux + uw / 2
+            ucy = uy + uh / 2
+
+            centre_dist = np.hypot(cx - ucx, cy - ucy)
+
+            if centre_dist < centre_threshold:
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            unique.append(box)
+
+    return unique
  
  
 def _nms(boxes, scores, iou_threshold=0.3):
@@ -191,31 +216,61 @@ def _build_landmarker():
  
 def detect_landmarks(bgr_img, face_boxes):
     h_img, w_img = bgr_img.shape[:2]
-    rgb    = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+    rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
     mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     result = _build_landmarker().detect(mp_img)
- 
+
     if not result.face_landmarks:
         return [None] * len(face_boxes)
- 
+
     mesh_pts = [
         np.array([[lm.x * w_img, lm.y * h_img] for lm in fl], dtype=np.float32)
         for fl in result.face_landmarks
     ]
+
     centres = [pts.mean(axis=0) for pts in mesh_pts]
- 
+
     out = []
+    used_landmark_indices = set()
+
     for (bx, by, bw, bh) in face_boxes:
-        cx, cy = bx + bw / 2, by + bh / 2
-        best   = int(np.argmin([np.hypot(c[0]-cx, c[1]-cy) for c in centres]))
-        pts    = mesh_pts[best]
+        box_cx = bx + bw / 2
+        box_cy = by + bh / 2
+
+        best_idx = None
+        best_dist = float("inf")
+
+        for i, centre in enumerate(centres):
+            if i in used_landmark_indices:
+                continue
+
+            dist = np.hypot(centre[0] - box_cx, centre[1] - box_cy)
+
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+
+        if best_idx is None:
+            out.append(None)
+            continue
+
+        used_landmark_indices.add(best_idx)
+
+        pts = mesh_pts[best_idx]
+
         re = pts[_RIGHT_EYE_IDX].mean(axis=0)
-        le = pts[_LEFT_EYE_IDX ].mean(axis=0)
+        le = pts[_LEFT_EYE_IDX].mean(axis=0)
         nt = pts[_NOSE_TIP_IDX]
-        out.append((tuple(re.astype(int)), tuple(le.astype(int)), tuple(nt.astype(int))))
- 
+
+        out.append((
+            tuple(re.astype(int)),
+            tuple(le.astype(int)),
+            tuple(nt.astype(int))
+        ))
+
     while len(out) < len(face_boxes):
         out.append(None)
+
     return out
  
  
@@ -279,13 +334,11 @@ def overlay_faces(out_img, faces, lmks_list):
  
 def process_image(bgr_img, draw=True):
     out = bgr_img.copy()
-    boxes = detect_faces(bgr_img)[:4]
-    n_faces = len(boxes)
 
-    for (x, y, w, h) in boxes:
-        draw_box(out, x, y, w, h)
+    # First remove obvious duplicate face boxes before doing landmarks/alignment.
+    boxes = remove_duplicate_face_boxes(detect_faces(bgr_img), centre_threshold=40)[:4]
 
-    if n_faces == 0:
+    if len(boxes) == 0:
         return out, [], [], 0
 
     all_lmks = detect_landmarks(bgr_img, boxes)
@@ -293,6 +346,10 @@ def process_image(bgr_img, draw=True):
     faces = []
     embedding_faces = []
     aligned_lmks = []
+
+    kept_box_centres = []
+    kept_landmark_triplets = []
+    kept_face_hashes = []
 
     for (x, y, w, h), lmks in zip(boxes, all_lmks):
         if lmks is None:
@@ -304,18 +361,68 @@ def process_image(bgr_img, draw=True):
 
         re, le, nt = lmks
 
-        if draw:
-            draw_landmarks(out, re, le, nt)
+        current_centre = np.array([x + w / 2, y + h / 2], dtype=np.float32)
+        current_triplet = np.array([re, le, nt], dtype=np.float32)
+
+        is_duplicate = False
+
+        # Duplicate check 1: same source-image face location.
+        for old_centre in kept_box_centres:
+            centre_dist = np.linalg.norm(current_centre - old_centre)
+
+            if centre_dist < 8:
+                is_duplicate = True
+                break
+
+        if is_duplicate:
+            continue
+
+        # Duplicate check 2: same source-image landmark positions.
+        for old_triplet in kept_landmark_triplets:
+            landmark_dist = np.mean(
+                np.linalg.norm(current_triplet - old_triplet, axis=1)
+            )
+
+            if landmark_dist < 15:
+                is_duplicate = True
+                break
+
+        if is_duplicate:
+            continue
 
         face, M = align_face(bgr_img, re, le, nt)
+
+        # Duplicate check 3: very similar aligned crop.
+        face_gray = cv2.resize(
+            cv2.cvtColor(face, cv2.COLOR_BGR2GRAY),
+            (32, 32)
+        )
+        face_hash = face_gray.astype(np.float32).flatten()
+        face_hash = face_hash / (np.linalg.norm(face_hash) + 1e-6)
+
+        for old_hash in kept_face_hashes:
+            similarity = float(np.dot(face_hash, old_hash))
+
+            if similarity > 0.995:
+                is_duplicate = True
+                break
+
+        if is_duplicate:
+            continue
+
+        kept_box_centres.append(current_centre)
+        kept_landmark_triplets.append(current_triplet)
+        kept_face_hashes.append(face_hash)
+
         faces.append(face)
 
-        embed_crop = crop_face_for_embedding(bgr_img, (x, y, w, h))
+        # Important: use the same aligned crop for identity embedding.
+        # This keeps the saved crop and clustering input consistent.
+        embedding_faces.append(face)
 
-        if embed_crop is not None:
-            embedding_faces.append(embed_crop)
-        else:
-            embedding_faces.append(face)
+        if draw:
+            draw_box(out, x, y, w, h)
+            draw_landmarks(out, re, le, nt)
 
         def clamp(p):
             return (
@@ -328,7 +435,7 @@ def process_image(bgr_img, draw=True):
 
     overlay_faces(out, faces, aligned_lmks)
 
-    return out, faces, embedding_faces, n_faces
+    return out, faces, embedding_faces, len(faces)
  
  
 # ─────────────────────────────────────────────
@@ -388,7 +495,7 @@ def extract_embedding(face_bgr):
 # CLUSTERING
 # ─────────────────────────────────────────────
  
-def cluster_identities(embeddings, distance_threshold=0.62):
+def cluster_identities(embeddings, distance_threshold=0.6):
     if not embeddings:
         return np.array([], dtype=int)
 
@@ -404,7 +511,7 @@ def cluster_identities(embeddings, distance_threshold=0.62):
         model = AgglomerativeClustering(
             n_clusters=None,
             metric="precomputed",
-            linkage="complete",
+            linkage="average",
             distance_threshold=distance_threshold
         )
     except TypeError:
@@ -463,30 +570,57 @@ def bulk_process(folder_path, progress_callback=None):
             embeddings.append(extract_embedding(embed_face))
 
             global_face_id = len(records)
-            records.append((global_face_id, display_face_rs))
+            records.append((global_face_id, display_face_rs, fname))
         if progress_callback:
             progress_callback(n_done, len(files))
  
     n_identities = 0
+
     if embeddings:
-        labels       = cluster_identities(embeddings)
+        labels = cluster_identities(embeddings)
         n_identities = int(labels.max()) + 1
-        for (m, img), lbl in zip(records, labels):
-            cv2.imwrite(os.path.join(out_folder, f'Identity_{lbl}_face_{m}.jpg'), img)
 
-    labels = cluster_identities(embeddings)
-    print("Cluster labels:", labels)
+        filtered_records = []
+        filtered_labels = []
+        seen_source_identity = set()
 
-    groups = {}
-    for (face_id, _), lbl in zip(records, labels):
-        groups.setdefault(lbl, []).append(face_id)
+        for record, lbl in zip(records, labels):
+            face_id, img, source_fname = record
+            source_base = os.path.splitext(source_fname)[0]
+            key = (source_base, int(lbl))
 
-    print("Identity groups:")
-    for lbl, face_ids in groups.items():
-        print(f"Identity {lbl}: faces {face_ids}")
+            if key in seen_source_identity:
+                print(f"Skipping duplicate from source image {source_base}: face {face_id} in Identity_{lbl}")
+                continue
 
-    n_identities = int(labels.max()) + 1
-    print("Number of identities:", n_identities)
+            seen_source_identity.add(key)
+            filtered_records.append(record)
+            filtered_labels.append(lbl)
+
+        records = filtered_records
+        labels = np.array(filtered_labels, dtype=int)
+
+        n_identities = len(set(labels))
+        total_faces = len(records)
+
+        for (m, img, source_fname), lbl in zip(records, labels):
+            base_name = os.path.splitext(source_fname)[0]
+            cv2.imwrite(
+                os.path.join(out_folder, f'Identity_{lbl}_{base_name}_face_{m}.jpg'),
+                img
+            )
+
+        print("Cluster labels:", labels)
+
+        groups = {}
+        for (face_id, _, source_fname), lbl in zip(records, labels):
+            groups.setdefault(lbl, []).append(f"{source_fname}: face {face_id}")
+
+        print("Identity groups:")
+        for lbl, face_ids in groups.items():
+            print(f"Identity {lbl}: faces {face_ids}")
+
+        print("Number of identities:", n_identities)
  
     return dict(n_images=n_done, n_faces=total_faces, n_identities=n_identities,
                 elapsed=time.time()-t0, output_folder=out_folder)

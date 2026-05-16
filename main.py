@@ -29,6 +29,10 @@ MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
 os.makedirs(MODELS_DIR, exist_ok=True)
  
 DETECTOR_MODEL_PATH   = os.path.join(MODELS_DIR, 'blaze_face_short_range.tflite')
+DETECTOR_FULL_MODEL_PATH = os.path.join(MODELS_DIR, 'blaze_face_full_range.tflite')
+DETECTOR_FULL_URL = ('https://storage.googleapis.com/mediapipe-models/'
+                     'face_detector/blaze_face_full_range/float16/1/'
+                     'blaze_face_full_range.tflite')
 LANDMARKER_MODEL_PATH = os.path.join(MODELS_DIR, 'face_landmarker.task')
 SFACE_MODEL_PATH = os.path.join(MODELS_DIR, 'face_recognition_sface_2021dec.onnx')
  
@@ -53,6 +57,7 @@ def _download_if_missing(path, url):
  
  
 _download_if_missing(DETECTOR_MODEL_PATH,   DETECTOR_URL)
+_download_if_missing(DETECTOR_FULL_MODEL_PATH, DETECTOR_FULL_URL)
 _download_if_missing(LANDMARKER_MODEL_PATH, LANDMARKER_URL)
 _download_if_missing(SFACE_MODEL_PATH, SFACE_URL)
  
@@ -88,7 +93,9 @@ def skin_mask(bgr_img):
  
  
 def skin_ratio_in_box(mask, x, y, w, h):
-    roi = mask[y:y+h, x:x+w]
+    # Only check top 60% of box - avoids clothing at bottom affecting score
+    face_h = int(h * 0.6)
+    roi = mask[y:y+face_h, x:x+w]
     if roi.size == 0:
         return 0.0
     return float(np.count_nonzero(roi)) / roi.size
@@ -98,43 +105,90 @@ def skin_ratio_in_box(mask, x, y, w, h):
 # FACE DETECTION
 # ─────────────────────────────────────────────
  
-def _build_detector():
+def _build_detector_short():
     opts = mp_vision.FaceDetectorOptions(
         base_options=mp_python.BaseOptions(model_asset_path=DETECTOR_MODEL_PATH),
         min_detection_confidence=0.25,
     )
     return mp_vision.FaceDetector.create_from_options(opts)
- 
+
+def _build_detector_full():
+    opts = mp_vision.FaceDetectorOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=DETECTOR_FULL_MODEL_PATH),
+        min_detection_confidence=0.25,
+    )
+    return mp_vision.FaceDetector.create_from_options(opts)
+
+def _detect_opencv_haar(bgr_img):
+    gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    faces = cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.05,
+        minNeighbors=5,
+        minSize=(60, 60)
+    )
+    raw = []
+    if len(faces) > 0:
+        for (x, y, w, h) in faces:
+            h_img = bgr_img.shape[0]
+            box_centre_y = y + h / 2
+            if box_centre_y > h_img * 0.75:
+                continue
+            aspect = w / max(h, 1)
+            if aspect < 0.7 or aspect > 1.4:
+                continue
+            raw.append((x, y, w, h, 1.0))  # high score = trusted
+    return raw
  
 def detect_faces(bgr_img, skin_threshold=0.05):
     h_img, w_img = bgr_img.shape[:2]
-    s_mask  = skin_mask(bgr_img)
-    rgb     = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
-    mp_img  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-    result  = _build_detector().detect(mp_img)
- 
+    s_mask = skin_mask(bgr_img)
+    rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
     raw = []
-    if result.detections:
-        for det in result.detections:
-            bb   = det.bounding_box
-            x, y = max(0, bb.origin_x), max(0, bb.origin_y)
-            w    = min(bb.width,  w_img - x)
-            h    = min(bb.height, h_img - y)
-            score = det.categories[0].score if det.categories else 0.5
-            raw.append((x, y, w, h, score))
- 
+
+    # MediaPipe short range + full range detectors
+    for detector in [_build_detector_short(), _build_detector_full()]:
+        result = detector.detect(mp_img)
+        if result.detections:
+            for det in result.detections:
+                bb = det.bounding_box
+                x, y = max(0, bb.origin_x), max(0, bb.origin_y)
+                w = min(bb.width,  w_img - x)
+                h = min(bb.height, h_img - y)
+                score = det.categories[0].score if det.categories else 0.5
+                raw.append((x, y, w, h, score))
+
+    # Haar cascade as third detector
+    raw += _detect_opencv_haar(bgr_img)
+
+    print("ALL RAW BOXES:")
+    for (x, y, w, h, s) in raw:
+        skin = skin_ratio_in_box(s_mask, x, y, w, h)
+        print(f"  x={x} y={y} w={w} h={h} score={s:.2f} skin={skin:.3f}")
+
     # Use skin colour to filter false positives
     filtered = [(x, y, w, h, s) for (x, y, w, h, s) in raw
-                if skin_ratio_in_box(s_mask, x, y, w, h) >= skin_threshold]
+                if s >= 1.0 or skin_ratio_in_box(s_mask, x, y, w, h) >= skin_threshold]
     if not filtered:
-        filtered = raw  # fallback: keep all if skin filter removes everything
+        filtered = raw
     if not filtered:
         return []
- 
+
+    print("AFTER SKIN FILTER:")
+    for (x, y, w, h, s) in filtered:
+        print(f"  x={x} y={y} w={w} h={h} score={s:.2f}")
+
     boxes_np  = np.array([[x, y, x+w, y+h] for (x, y, w, h, _) in filtered], dtype=np.float32)
     scores_np = np.array([s for (_, _, _, _, s) in filtered], dtype=np.float32)
     indices   = _nms(boxes_np, scores_np)
- 
+
+    print("AFTER NMS:")
+    for i in indices:
+        print(f"  x={int(boxes_np[i][0])} y={int(boxes_np[i][1])} w={int(boxes_np[i][2]-boxes_np[i][0])} h={int(boxes_np[i][3]-boxes_np[i][1])}")
+
     return [(int(boxes_np[i][0]), int(boxes_np[i][1]),
              int(boxes_np[i][2] - boxes_np[i][0]),
              int(boxes_np[i][3] - boxes_np[i][1])) for i in indices]
@@ -205,12 +259,13 @@ def _build_landmarker():
     opts = mp_vision.FaceLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=LANDMARKER_MODEL_PATH),
         num_faces=4,
-        min_face_detection_confidence=0.4,
-        min_face_presence_confidence=0.4,
-        min_tracking_confidence=0.4,
+        min_face_detection_confidence=0.2,  # lower from 0.4
+        min_face_presence_confidence=0.2,   # lower from 0.4
+        min_tracking_confidence=0.2,        # lower from 0.4
         output_face_blendshapes=False,
         output_facial_transformation_matrixes=False,
     )
+
     return mp_vision.FaceLandmarker.create_from_options(opts)
  
  
@@ -219,6 +274,7 @@ def detect_landmarks(bgr_img, face_boxes):
     rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
     mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     result = _build_landmarker().detect(mp_img)
+    print(f"FaceMesh found {len(result.face_landmarks) if result.face_landmarks else 0} landmark sets")
 
     if not result.face_landmarks:
         return [None] * len(face_boxes)
@@ -369,25 +425,25 @@ def process_image(bgr_img, draw=True):
         # Duplicate check 1: same source-image face location.
         for old_centre in kept_box_centres:
             centre_dist = np.linalg.norm(current_centre - old_centre)
-
-            if centre_dist < 8:
+            if centre_dist < 5:
                 is_duplicate = True
                 break
 
         if is_duplicate:
             continue
 
-        # Duplicate check 2: same source-image landmark positions.
-        for old_triplet in kept_landmark_triplets:
-            landmark_dist = np.mean(
-                np.linalg.norm(current_triplet - old_triplet, axis=1)
-            )
-
-            if landmark_dist < 15:
-                is_duplicate = True
-                break
+        # Duplicate check 2: only run if landmarks are real (not estimated)
+        if lmks is not None:
+            for old_triplet in kept_landmark_triplets:
+                landmark_dist = np.mean(
+                    np.linalg.norm(current_triplet - old_triplet, axis=1)
+                )
+                if landmark_dist < 5:
+                    is_duplicate = True
+                    break
 
         if is_duplicate:
+            print(f"DROPPED as duplicate: box centre={current_centre}")
             continue
 
         face, M = align_face(bgr_img, re, le, nt)
@@ -495,7 +551,7 @@ def extract_embedding(face_bgr):
 # CLUSTERING
 # ─────────────────────────────────────────────
  
-def cluster_identities(embeddings, distance_threshold=0.6):
+def cluster_identities(embeddings, distance_threshold=0.65):
     if not embeddings:
         return np.array([], dtype=int)
 
@@ -511,7 +567,7 @@ def cluster_identities(embeddings, distance_threshold=0.6):
         model = AgglomerativeClustering(
             n_clusters=None,
             metric="precomputed",
-            linkage="average",
+            linkage="complete",
             distance_threshold=distance_threshold
         )
     except TypeError:

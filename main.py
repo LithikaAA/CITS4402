@@ -29,6 +29,9 @@ MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
 os.makedirs(MODELS_DIR, exist_ok=True)
  
 DETECTOR_MODEL_PATH   = os.path.join(MODELS_DIR, 'blaze_face_short_range.tflite')
+# CHANGE: added the full-range detector model path + URL
+# short range is good for selfie-distance faces, full range handles
+# faces that are further away or at more of an angle (like Monica in img 7)
 DETECTOR_FULL_MODEL_PATH = os.path.join(MODELS_DIR, 'blaze_face_full_range.tflite')
 DETECTOR_FULL_URL = ('https://storage.googleapis.com/mediapipe-models/'
                      'face_detector/blaze_face_full_range/float16/1/'
@@ -57,7 +60,7 @@ def _download_if_missing(path, url):
  
  
 _download_if_missing(DETECTOR_MODEL_PATH,   DETECTOR_URL)
-_download_if_missing(DETECTOR_FULL_MODEL_PATH, DETECTOR_FULL_URL)
+_download_if_missing(DETECTOR_FULL_MODEL_PATH, DETECTOR_FULL_URL) # CHANGE: download full range too
 _download_if_missing(LANDMARKER_MODEL_PATH, LANDMARKER_URL)
 _download_if_missing(SFACE_MODEL_PATH, SFACE_URL)
  
@@ -93,7 +96,10 @@ def skin_mask(bgr_img):
  
  
 def skin_ratio_in_box(mask, x, y, w, h):
-    # Only check top 60% of box - avoids clothing at bottom affecting score
+    # CHANGE: only check the top 60% of the bounding box instead of the whole thing
+    # reason: dark clothing at the bottom of a box was dragging the skin ratio down
+    # and causing faces like Monica (dark outfit) to get filtered out. checking
+    # just the face region fixes this without lowering the threshold everywhere
     face_h = int(h * 0.6)
     roi = mask[y:y+face_h, x:x+w]
     if roi.size == 0:
@@ -105,6 +111,8 @@ def skin_ratio_in_box(mask, x, y, w, h):
 # FACE DETECTION
 # ─────────────────────────────────────────────
  
+# CHANGE: split the old _build_detector() into two separate functions
+# one for short range (close/frontal faces) and one for full range (angled/distant)
 def _build_detector_short():
     opts = mp_vision.FaceDetectorOptions(
         base_options=mp_python.BaseOptions(model_asset_path=DETECTOR_MODEL_PATH),
@@ -119,6 +127,11 @@ def _build_detector_full():
     )
     return mp_vision.FaceDetector.create_from_options(opts)
 
+# CHANGE: added OpenCV Haar cascade as a third detector
+# mediapipe was completely missing Monica in image 7 (her face is slightly turned
+# and darker). Haar uses a totally different algorithm and catches faces the
+# deep learning models miss. minNeighbors=5 keeps false positives low,
+# and we filter by position + aspect ratio to avoid detecting chests/backgrounds
 def _detect_opencv_haar(bgr_img):
     gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
@@ -133,14 +146,21 @@ def _detect_opencv_haar(bgr_img):
         for (x, y, w, h) in faces:
             h_img = bgr_img.shape[0]
             box_centre_y = y + h / 2
+            # skip boxes in the bottom 25% of the image (likely bodies not faces)
             if box_centre_y > h_img * 0.75:
                 continue
+            # faces are roughly square, skip anything too wide or too tall
             aspect = w / max(h, 1)
             if aspect < 0.7 or aspect > 1.4:
                 continue
+            # CHANGE: score of 1.0 flags this as a trusted Haar detection
+            # this lets it bypass the skin filter (see detect_faces below)
+            # since Haar with minNeighbors=5 is already pretty strict
             raw.append((x, y, w, h, 1.0))  # high score = trusted
     return raw
  
+# CHANGE: completely rewrote detect_faces to run all three detectors
+# old version only used short range mediapipe
 def detect_faces(bgr_img, skin_threshold=0.05):
     h_img, w_img = bgr_img.shape[:2]
     s_mask = skin_mask(bgr_img)
@@ -169,11 +189,12 @@ def detect_faces(bgr_img, skin_threshold=0.05):
         skin = skin_ratio_in_box(s_mask, x, y, w, h)
         print(f"  x={x} y={y} w={w} h={h} score={s:.2f} skin={skin:.3f}")
 
-    # Use skin colour to filter false positives
+    # CHANGE: skin filter now bypasses for Haar detections (score == 1.0)
+    # mediapipe detections still go through the skin check as before
     filtered = [(x, y, w, h, s) for (x, y, w, h, s) in raw
                 if s >= 1.0 or skin_ratio_in_box(s_mask, x, y, w, h) >= skin_threshold]
     if not filtered:
-        filtered = raw
+        filtered = raw # fallback: keep all if skin filter removes everything
     if not filtered:
         return []
 
@@ -256,6 +277,9 @@ _NOSE_TIP_IDX  = 4
  
  
 def _build_landmarker():
+    # CHANGE: lowered all confidence thresholds from 0.4 to 0.2
+    # FaceMesh was only finding 2/3 landmark sets for image 7 at 0.4
+    # lowering to 0.2 helps it pick up faces that mediapipe found borderline
     opts = mp_vision.FaceLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=LANDMARKER_MODEL_PATH),
         num_faces=4,
@@ -416,13 +440,18 @@ def process_image(bgr_img, draw=True):
             )
 
         re, le, nt = lmks
-
+        
+        # NOTE: we intentionally do NOT apply the None fallback here yet 
+        # we need the raw lmks value to decide whether to run duplicate check 2
+        
         current_centre = np.array([x + w / 2, y + h / 2], dtype=np.float32)
         current_triplet = np.array([re, le, nt], dtype=np.float32)
 
         is_duplicate = False
 
-        # Duplicate check 1: same source-image face location.
+        # Duplicate check 1: same box centre (threshold lowered from 8 to 5)
+        # CHANGE: tightened from 8→5 pixels so faces that are close together
+        # (like in image 7) don't incorrectly get flagged as duplicates
         for old_centre in kept_box_centres:
             centre_dist = np.linalg.norm(current_centre - old_centre)
             if centre_dist < 5:
@@ -551,7 +580,7 @@ def extract_embedding(face_bgr):
 # CLUSTERING
 # ─────────────────────────────────────────────
  
-def cluster_identities(embeddings, distance_threshold=0.65):
+def cluster_identities(embeddings, distance_threshold=0.80):
     if not embeddings:
         return np.array([], dtype=int)
 

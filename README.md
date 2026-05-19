@@ -29,6 +29,8 @@ pip install -r requirements.txt
 
 **3. Run the application:**
 ```bash
+python3 -m venv venv
+venv\Scripts\activate
 python CITS4402_Script.py
 ```
 
